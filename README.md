@@ -11,9 +11,10 @@ journal for kill-and-resume script runs. Built on `@earendil-works/pi-codemode`
 invoke host tools on omp 18.12.6: the extension `pi` surface exposes `exec` and
 tool enumeration only, so `codemode` scripts bind **zero tools** regardless of
 bridge code (diagnosis and binary evidence in
-`docs/integration-result.md` §8). Until a future omp restores a nested-invoke
-API (`ctx.executeTool` / `reachesTools`), this plugin is **available-inert**:
-code on disk, not live.
+`docs/integration-result.md` §8). Until a future omp restores a
+nested-invoke API (`ctx.executeTool` / `reachesTools`), this plugin is
+**parked**: it installs, registers, and executes scripts (verified — see
+Install), but scripts can't call host tools yet.
 
 Two consequences follow from that:
 
@@ -30,30 +31,26 @@ Two consequences follow from that:
 
 ## Install
 
-Via plugin manager (from the repo root):
+Tested end-to-end on omp 18.12.6 (2026-10-25): install registers the
+`codemode` tool, a fresh `omp -p` session executed `return 1 + 1;` → `2`
+through the sandbox, and uninstall restored `settings.json` byte-identical.
+Note the STATUS above: scripts currently bind zero host tools on 18.12.6.
 
 ```sh
-omp plugin install <repo-url>
+git clone https://github.com/Zpankz/omp-codemode
+cd omp-codemode && bun install && bun run build
+omp plugin install "$PWD"        # links the plugin; no settings.json edit needed
+omp plugin list                  # → omp-codemode@0.1.0
 ```
 
-or manually:
+Remove with `omp plugin uninstall omp-codemode`.
 
-```sh
-git clone <repo-url> omp-codemode
-cd omp-codemode
-bun install
-bun run build
-```
-
-Then enable the extension entry (`extensions/index.ts` re-exports the
-prebuilt `dist/omp-codemode.js` bundle — the omp loader cannot resolve bare
-third-party imports from source, so the bundled dist is the load path):
-
-```json
-{ "extensions": ["+extensions/omp-codemode"] }
-```
-
-depending on your omp extensions allowlist layout; see your `settings.json`.
+The plugin entry (`extensions/index.ts`) re-exports the prebuilt
+`dist/omp-codemode.js` bundle — the omp loader cannot resolve bare
+third-party imports from source, so the bundled dist is the load path.
+Do NOT add anything to the `extensions` allowlist in `settings.json`;
+the plugin manager owns registration (verified: settings untouched by
+install/uninstall).
 
 ## Usage
 
