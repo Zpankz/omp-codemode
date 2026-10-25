@@ -246,3 +246,21 @@ rebuilding tool-calling. Approval caveat for any re-enable: nested
 `ctx.executeTool` calls may bypass the agent-loop approval gates that
 direct calls hit — compare nested vs direct `bash` under an
 approval-requiring mode before shipping.
+
+## 12. Resolution (2026-10-26)
+
+Probe (§8: no `ctx` tool path; `invokeTool` key present-but-undefined)
+→ source patch (`patches/oh-my-pi-v18.12.6-ctx-tools.patch`:
+`ctx.tools` / `ctx.executeTool` on the extension `ctx`, resolved through
+the eval bridge's ACP permission proxy — nested calls hit the same
+approval gate as `eval`; explicit deny blocks even under
+`--auto-approve`; extension-runner suite 106/106 PASS including a
+per-call gate test) → live proofs (patched binary: `codemode`
+`{ theme: dark, marker: CODEMODE_LIVE }` in one call; `durable_run`
+id `durable-live-02` → `durable-done`, `durable_status` finished/ok,
+`durable_resume` replayed without re-executing the write step — marker
+file holds a single `STEP` line) → install/publish (patched
+`dist/omp` installed over the existing binary with backup kept;
+this repo publishes the patch plus README Install § patched-omp).
+`omp update` overwrites the patched binary — re-apply the patch and
+rebuild after updating.

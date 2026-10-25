@@ -1,0 +1,493 @@
+diff --git a/packages/coding-agent/src/extensibility/extensions/runner.ts b/packages/coding-agent/src/extensibility/extensions/runner.ts
+index 7b9804375d..ac6e7d12ef 100644
+--- a/packages/coding-agent/src/extensibility/extensions/runner.ts
++++ b/packages/coding-agent/src/extensibility/extensions/runner.ts
+@@ -10,6 +10,7 @@ import {
+ 	type AgentToolUpdateCallback,
+ 	isNonBlankContext,
+ 	joinAdditionalContext,
++	validateAgentToolArguments,
+ } from "@oh-my-pi/pi-agent-core";
+ import type {
+ 	AssistantMessage,
+@@ -19,6 +20,7 @@ import type {
+ 	ProviderResponseMetadata,
+ 	TextContent,
+ } from "@oh-my-pi/pi-ai";
++import { toolWireSchema } from "@oh-my-pi/pi-ai";
+ import {
+ 	clearContextHistoryIndex,
+ 	getContextHistoryIndex,
+@@ -26,7 +28,7 @@ import {
+ 	setContextHistoryIndex,
+ } from "@oh-my-pi/pi-ai/utils/block-symbols";
+ import type { KeyId } from "@oh-my-pi/pi-tui";
+-import { logger } from "@oh-my-pi/pi-utils";
++import { isRecord, logger } from "@oh-my-pi/pi-utils";
+ import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
+ import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
+ import type { ModelRegistry } from "../../config/model-registry";
+@@ -34,6 +36,7 @@ import { type Settings, withActiveSettings } from "../../config/settings";
+ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
+ import type { MemoryRuntimeContext } from "../../memory-backend";
+ import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
++import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+ import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+ import { MAIN_AGENT_ID } from "../../registry/agent-registry";
+ import type { SessionManager } from "../../session/session-manager";
+@@ -41,6 +44,7 @@ import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-wr
+ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
+ import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
+ import { ManagedTimers } from "./managed-timers";
++import { schemaDeclaresIntentField } from "../../utils/tool-schema";
+ import { createExtensionModelQuery } from "./model-api";
+ import { trackUserWaits, type UserWaitTracker } from "./user-wait";
+ import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+@@ -73,7 +77,9 @@ import type {
+ 	ExtensionFlag,
+ 	ExtensionMode,
+ 	ExtensionRuntime,
++	ExtensionSessionToolInfo,
+ 	ExtensionShortcut,
++	ExtensionToolCallOutcome,
+ 	ExtensionUIContext,
+ 	ExtensionUIDialogOptions,
+ 	InputEvent,
+@@ -96,6 +102,7 @@ import type {
+ 	SessionStopEventResult,
+ 	ToolCallEvent,
+ 	ToolCallEventResult,
++	ToolDefinition,
+ 	ToolRegistrationListener,
+ 	ToolResultEvent,
+ 	ToolResultEventResult,
+@@ -656,6 +663,21 @@ export class ExtensionRunner {
+ 	#nativeToolResolver?: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined;
+ 	#toolCallPreflight?: ToolCallPreflight;
+ 
++	/**
++	 * Session-gated tool lookup backing `ctx.executeTool`. Set by the owning
++	 * session to `session.getToolForEvalBridge` (eval parity: the returned tool
++	 * already carries the `#wrapToolForAcpPermission` proxy, so
++	 * PERMISSION_REQUIRED names re-run the ACP gate on every nested call).
++	 * Unset when no session owns this runner (tests, runner-less contexts):
++	 * execution then fails closed with unknown-tool error outcomes.
++	 */
++	#sessionToolResolver?: (name: string) => AgentTool | undefined;
++
++	/** Wires the session-gated resolver used by {@link executeSessionTool}. */
++	setSessionToolResolver(resolve: (name: string) => AgentTool | undefined): void {
++		this.#sessionToolResolver = resolve;
++	}
++
+ 	/** Wires the native-tool resolver used by {@link invokeNativeTool}. */
+ 	setNativeToolResolver(
+ 		resolve: (name: string) => { tool: AgentTool; makeContext: () => AgentToolContext } | undefined,
+@@ -737,6 +759,142 @@ export class ExtensionRunner {
+ 			options?.callerContext ?? resolved.makeContext(),
+ 		)) as AgentToolResult<TDetails>;
+ 	}
++	/**
++	 * Display metadata for one session tool name for `ctx.tools` listing ONLY.
++	 * This never executes anything: the session-gated tool (when the session
++	 * wired one) carries description/parameters, otherwise the pre-override
++	 * native or the registered extension definition does. `undefined` means the
++	 * name is not listable here. Execution resolves elsewhere — see
++	 * {@link executeSessionTool} — so listing metadata can never run a tool.
++	 */
++	#resolveSessionToolInfo(name: string): AgentTool | ToolDefinition | undefined {
++		const gated = this.#sessionToolResolver?.(name);
++		if (gated) return gated;
++		const native = this.#nativeToolResolver?.(name);
++		if (native) return native.tool;
++		for (const ext of this.extensions) {
++			const registered = ext.tools.get(name);
++			if (registered) return registered.definition;
++		}
++		return undefined;
++	}
++
++	/**
++	 * Session's enabled tools as `ctx.tools` data. Names come from the calling
++	 * tool's own loop context (`toolNames` the session keeps current), unioned with
++	 * this runner's registered extension tools; each entry resolves through
++	 * `#resolveSessionToolInfo` (metadata only, never executed) and unresolvable
++	 * names are skipped. `codemode` itself is excluded so a script cannot
++	 * re-enter its own host tool.
++	 */
++	#listSessionTools(delegation?: { context?: AgentToolContext }): ExtensionSessionToolInfo[] {
++		const names = new Set<string>();
++		const toolNames = (delegation?.context as { toolNames?: unknown } | undefined)?.toolNames;
++		if (Array.isArray(toolNames)) {
++			for (const name of toolNames) if (typeof name === "string") names.add(name);
++		}
++		for (const ext of this.extensions) {
++			for (const name of ext.tools.keys()) names.add(name);
++		}
++		names.delete("codemode");
++		const infos: ExtensionSessionToolInfo[] = [];
++		for (const name of names) {
++			const tool = this.#resolveSessionToolInfo(name);
++			if (!tool) continue;
++			const info: ExtensionSessionToolInfo = {
++				name,
++				description: tool.description ?? "",
++				parameters: toolWireSchema(tool),
++			};
++			const outputSchema = (tool as { outputSchema?: unknown }).outputSchema;
++			if (outputSchema !== undefined) info.outputSchema = outputSchema;
++			infos.push(info);
++		}
++		return infos;
++	}
++
++	/**
++	 * Execute a session tool by name for an extension-hosted script runtime
++	 * (`ctx.executeTool`). Mirrors the eval js bridge (`callSessionTool` in
++	 * `eval/js/tool-bridge.ts`): the tool resolves EXCLUSIVELY through the
++	 * session's `getToolForEvalBridge` path — the same ACP-permission-gated
++	 * lookup direct eval calls use — so a PERMISSION_REQUIRED tool re-runs the
++	 * gate on every nested call instead of inheriting the outer approval.
++	 * There is no direct-registry or registered-definition execution path here:
++	 * when the session wired no resolver, or the name is not an enabled gated
++	 * tool, the call resolves to an unknown-tool error outcome. As with the
++	 * eval bridge, the `codemode` name, unknown names, argument validation
++	 * failures, aborts, and execution errors all resolve to error outcomes
++	 * (`isError: true`) — nothing thrown across the boundary — so scripts
++	 * branch on failure exactly like any other result.
++	 */
++	async #executeSessionTool(
++		name: string,
++		args: unknown,
++		options: { signal?: AbortSignal } | undefined,
++		delegation: { context?: AgentToolContext; signal?: AbortSignal } | undefined,
++	): Promise<ExtensionToolCallOutcome> {
++		const errorOutcome = (text: string): ExtensionToolCallOutcome => ({
++			result: { content: [{ type: "text", text }] },
++			isError: true,
++		});
++		if (name === "codemode") {
++			return errorOutcome(`Tool "codemode" cannot run through executeTool (no recursive codemode).`);
++		}
++		// Eval parity: the ONLY lookup. The returned tool already carries the
++		// session's permission proxy, so gating (including denial, which throws
++		// inside the proxy) behaves exactly as for a direct eval-bridge call.
++		// Anything else — session-less runner, disabled or unregistered name —
++		// fails closed here instead of running ungated.
++		const tool = this.#sessionToolResolver?.(name);
++		if (!tool) return errorOutcome(`Unknown tool: ${name}`);
++		// Same validation path as `callSessionTool`: a schema-owned name stays tool
++		// data across alternatives, and script-forged `__parseError`/`__rawJson`
++		// keys are stripped by lenient validation.
++		const intentDeclared = schemaDeclaresIntentField(toolWireSchema(tool));
++		const validationArgs = isRecord(args) ? { ...args } : args;
++		if (isRecord(validationArgs) && !intentDeclared) delete validationArgs[INTENT_FIELD];
++		const toolCallId = `ctx-${name}-${crypto.randomUUID()}`;
++		let validated: unknown;
++		try {
++			validated = validateAgentToolArguments(
++				tool,
++				{ type: "toolCall", id: toolCallId, name, arguments: validationArgs as Record<string, unknown> },
++				"payload",
++			);
++		} catch (error) {
++			return errorOutcome(error instanceof Error ? error.message : String(error));
++		}
++		try {
++			const signal = options?.signal ?? delegation?.signal;
++			signal?.throwIfAborted();
++			// The gate lives on the resolved tool object (the session's
++			// permission proxy), exactly as in `callSessionTool`: denial throws
++			// here and maps to an error outcome below, never to execution.
++			// The outer call's loop context is preserved for toolCall/provider
++			// metadata, as with `ctx.invokeTool`.
++			const result: AgentToolResult = await tool.execute(
++				toolCallId,
++				validated as never,
++				signal,
++				undefined,
++				delegation?.context,
++			);
++			const content = (result.content ?? []).map(block => {
++				if (block.type === "text" && typeof block.text === "string") return { type: "text", text: block.text };
++				const { type, ...rest } = block as unknown as { type: string; [key: string]: unknown };
++				return { type, ...rest };
++			});
++			const outcome: ExtensionToolCallOutcome = { result: { content } };
++			if (result.details !== undefined) outcome.result.structuredContent = result.details;
++			if (result.isError === true || (isRecord(result.details) && result.details.isError === true)) {
++				outcome.isError = true;
++			}
++			return outcome;
++		} catch (error) {
++			return errorOutcome(error instanceof Error ? error.message : String(error));
++		}
++	}
+ 
+ 	constructor(
+ 		private readonly extensions: Extension[],
+@@ -1551,6 +1709,8 @@ export class ExtensionRunner {
+ 								callerContext: delegation.context,
+ 							})
+ 					: undefined,
++			tools: this.#listSessionTools(delegation),
++			executeTool: (name, args, options) => this.#executeSessionTool(name, args, options, delegation),
+ 		};
+ 	}
+ 
+diff --git a/packages/coding-agent/src/extensibility/extensions/types.ts b/packages/coding-agent/src/extensibility/extensions/types.ts
+index c78dfd9fc2..61cedb7b53 100644
+--- a/packages/coding-agent/src/extensibility/extensions/types.ts
++++ b/packages/coding-agent/src/extensibility/extensions/types.ts
+@@ -668,6 +668,40 @@ export type ExtensionAnnotationsFactory = (
+ 	sendUserMessage: (text: string, options?: SendUserMessageOptions) => void,
+ ) => ExtensionAnnotationsAPI;
+ 
++/**
++ * A session tool advertised to extension-hosted script runtimes (e.g. codemode)
++ * as `ctx.tools` data. Structural contract those runtimes consume: `name` and
++ * `description` select and document the tool, `parameters` is the JSON Schema of
++ * its single argument object, and `outputSchema` — when present — marks a tool
++ * whose outcome carries machine-readable `structuredContent` alongside text.
++ */
++export interface ExtensionSessionToolInfo {
++	/** Tool name as invoked through `executeTool`. */
++	name: string;
++	/** Human-readable description for the tool. */
++	description: string;
++	/** JSON Schema of the tool's single argument object. */
++	parameters?: unknown;
++	/** JSON Schema of the tool's structured output, when the tool declares one. */
++	outputSchema?: unknown;
++}
++
++/**
++ * Outcome of `ExtensionContext.executeTool`. Mirrors the tool-result shape
++ * script runtimes consume: `result.content` text blocks render the
++ * human-readable output, `result.structuredContent` (read only when the tool
++ * declares `outputSchema`) carries the machine-readable value, and `isError`
++ * marks failure. Failures arrive here, never as a thrown exception, so scripts
++ * branch on them exactly like any other result.
++ */
++export interface ExtensionToolCallOutcome {
++	result: {
++		content?: Array<{ type: string; text?: string }>;
++		structuredContent?: unknown;
++	};
++	isError?: boolean;
++}
++
+ export interface ExtensionContext {
+ 	/** UI methods for user interaction */
+ 	ui: ExtensionUIContext;
+@@ -792,6 +826,30 @@ export interface ExtensionContext {
+ 		params: Record<string, unknown>,
+ 		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+ 	): Promise<AgentToolResult<TDetails>>;
++	/**
++	 * Session's enabled tools as data for extension-hosted script runtimes
++	 * (e.g. codemode maps these to sandbox-callable `tools.<name>` functions).
++	 * Names come from the calling tool's own loop context (`toolNames` the
++	 * session keeps current), unioned with this runner's registered extension
++	 * tools. Entries carry display metadata only (listing never executes);
++	 * execution via {@link ExtensionContext.executeTool} re-resolves the name
++	 * through the session-gated lookup, so a listed name the gate does not
++	 * authorize still fails closed at call time. `codemode` itself is excluded
++	 * so a script cannot re-enter its own host tool.
++	 */
++	tools: ExtensionSessionToolInfo[];
++	/**
++	 * Execute any session tool by name for an extension-hosted script runtime.
++	 * Mirrors the eval js bridge (`callSessionTool` in `eval/js/tool-bridge.ts`):
++	 * the tool resolves EXCLUSIVELY through the session's `getToolForEvalBridge`
++	 * path, so a PERMISSION_REQUIRED tool re-runs the session permission gate
++	 * on every nested call instead of inheriting the outer approval. Unknown
++	 * names (including a session-less runner with no gated lookup),
++	 * argument validation failures, and execution errors all arrive as error
++	 * outcomes (`isError: true`), never as thrown exceptions.
++	 * `codemode` itself resolves to an error outcome (no recursive codemode).
++	 */
++	executeTool(name: string, args: unknown, options?: { signal?: AbortSignal }): Promise<ExtensionToolCallOutcome>;
+ 
+ 	/**
+ 	 * Whether project-local inputs for the current working directory (extensions, settings,
+diff --git a/packages/coding-agent/src/session/agent-session.ts b/packages/coding-agent/src/session/agent-session.ts
+index cb90096e48..f73d340c13 100644
+--- a/packages/coding-agent/src/session/agent-session.ts
++++ b/packages/coding-agent/src/session/agent-session.ts
+@@ -1955,6 +1955,14 @@ export class AgentSession implements SettingsScope {
+ 		this.#promptTemplates = config.promptTemplates ?? [];
+ 		this.#slashCommands = config.slashCommands ?? [];
+ 		this.#extensionRunner = config.extensionRunner;
++		// Eval parity for `ctx.executeTool`: nested script calls resolve
++		// EXCLUSIVELY through the session-gated bridge lookup (the same
++		// `#wrapToolForAcpPermission` proxy `callSessionTool` relies on), so a
++		// PERMISSION_REQUIRED tool re-runs the gate on every nested call
++		// instead of inheriting the outer approval. Wired here — rather than
++		// in the SDK's runner construction — because only the session owns
++		// both ends: this runner and the gated `SessionTools` registry.
++		this.#extensionRunner?.setSessionToolResolver(name => this.getToolForEvalBridge(name));
+ 		this.#cacheWarmer = config.cacheWarmer;
+ 		if (config.cacheWarmer) {
+ 			const warmer = config.cacheWarmer;
+@@ -8741,6 +8749,14 @@ export class AgentSession implements SettingsScope {
+ 			setInterval: (callback, ms, ...args) => this.#fallbackTimers().setInterval(callback, ms, ...args),
+ 			setTimeout: (callback, ms, ...args) => this.#fallbackTimers().setTimeout(callback, ms, ...args),
+ 			clearTimer: timer => this.#fallbackTimers().clear(timer),
++			// No runner owns tool resolution here (directly constructed sessions
++			// only): script runtimes see an empty toolset and structured
++			// unknown-tool outcomes, never throws.
++			tools: [],
++			executeTool: async name => ({
++				result: { content: [{ type: "text", text: `Unknown tool: ${name}` }] },
++				isError: true,
++			}),
+ 		};
+ 	}
+ 
+diff --git a/packages/coding-agent/test/extensions-runner.test.ts b/packages/coding-agent/test/extensions-runner.test.ts
+index 5948bc7744..a8b70e101f 100644
+--- a/packages/coding-agent/test/extensions-runner.test.ts
++++ b/packages/coding-agent/test/extensions-runner.test.ts
+@@ -4687,4 +4687,141 @@ describe("ExtensionRunner", () => {
+ 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
+ 		});
+ 	});
++	describe("extension context session tools", () => {
++		const makeRunner = async () => {
++			const result = await loadTestExtensions();
++			const runner = new ExtensionRunner(
++				result.extensions,
++				result.runtime,
++				tempDir.path(),
++				sessionManager,
++				modelRegistry,
++			);
++			const readTool = {
++				name: "read",
++				label: "Read",
++				description: "Read a file",
++				parameters: Type.Object({ path: Type.String() }),
++				approval: "read",
++				execute: async (_id: string, params: unknown) => ({
++					content: [{ type: "text" as const, text: `read:${(params as { path: string }).path}` }],
++				}),
++			} as AgentTool;
++			const boomTool = {
++				name: "boom",
++				label: "Boom",
++				description: "Always throws",
++				parameters: Type.Object({}),
++				approval: "read",
++				execute: async () => {
++					throw new Error("boom exploded");
++				},
++			} as AgentTool;
++			runner.setNativeToolResolver(name =>
++				name === "read"
++					? { tool: readTool, makeContext: () => ({}) as AgentToolContext }
++					: name === "boom"
++						? { tool: boomTool, makeContext: () => ({}) as AgentToolContext }
++						: undefined,
++			);
++			// Production wiring (`AgentSession` constructor): `ctx.executeTool`
++			// resolves EXCLUSIVELY through this session-gated lookup — the test
++			// analogue of `session.getToolForEvalBridge` — never the native
++			// resolver above (which serves `ctx.invokeTool` and `ctx.tools`
++			// metadata only).
++			runner.setSessionToolResolver(name => (name === "read" ? readTool : name === "boom" ? boomTool : undefined));
++			return runner;
++		};
++
++		const delegated = (toolNames: string[]) =>
++			({
++				toolName: "codemode",
++				context: { toolNames } as AgentToolContext,
++			}) as { toolName: string; context?: AgentToolContext };
++
++		it("lists enabled session tools and excludes the calling tool", async () => {
++			const ctx = (await makeRunner()).createContext(undefined, delegated(["read", "boom", "codemode", "ghost"]));
++			expect(ctx.tools.map(tool => tool.name).sort()).toEqual(["boom", "read"]);
++			const read = ctx.tools.find(tool => tool.name === "read");
++			expect(read?.description).toBe("Read a file");
++			expect(read?.parameters).toMatchObject({ type: "object" });
++		});
++
++		it("executes session tools and maps outcomes without throwing", async () => {
++			const ctx = (await makeRunner()).createContext(undefined, delegated(["read", "boom"]));
++			const ok = await ctx.executeTool("read", { path: "x.txt" });
++			expect(ok).toEqual({ result: { content: [{ type: "text", text: "read:x.txt" }] } });
++			const badArgs = await ctx.executeTool("read", {});
++			expect(badArgs.isError).toBe(true);
++			const thrown = await ctx.executeTool("boom", {});
++			expect(thrown.isError).toBe(true);
++			expect(JSON.stringify(thrown)).toContain("boom exploded");
++			const unknown = await ctx.executeTool("nope", {});
++			expect(unknown.isError).toBe(true);
++			const self = await ctx.executeTool("codemode", { code: "1+1" });
++			expect(self.isError).toBe(true);
++		});
++
++		it("aborts execution on an aborted signal", async () => {
++			const controller = new AbortController();
++			controller.abort();
++			const ctx = (await makeRunner()).createContext(undefined, delegated(["read"]));
++			const outcome = await ctx.executeTool("read", { path: "x.txt" }, { signal: controller.signal });
++			expect(outcome.isError).toBe(true);
++		});
++
++		it("re-runs the session permission gate on every nested PERMISSION_REQUIRED call", async () => {
++			const body = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
++			const permissionRequests: string[] = [];
++			let verdict: "allow" | "deny" = "deny";
++			// Faithful model of SessionTools' `#wrapToolForAcpPermission`
++			// (session/session-tools.ts): the gate proxies `execute`, consults
++			// the permission hook first, and denial throws BEFORE the tool body
++			// runs. The test asserts the hook — not just the outcome.
++			const gatedBash = new Proxy(
++				{
++					name: "bash",
++					label: "Bash",
++					description: "Run a command",
++					parameters: Type.Object({ command: Type.String() }),
++					execute: body,
++				} as unknown as AgentTool,
++				{
++					get: (target, prop) => {
++						if (prop !== "execute") return (target as unknown as Record<PropertyKey, unknown>)[prop];
++						return async (...args: unknown[]) => {
++							permissionRequests.push("bash");
++							if (verdict === "deny") throw new Error("Tool call rejected by user");
++							return await (target.execute as (...callArgs: unknown[]) => unknown)(...args);
++						};
++					},
++				},
++			);
++			const runner = await makeRunner();
++			runner.setSessionToolResolver(name => (name === "bash" ? gatedBash : undefined));
++			const ctx = runner.createContext(undefined, delegated(["bash"]));
++			const denied = await ctx.executeTool("bash", { command: "echo GATED" });
++			expect(denied.isError).toBe(true);
++			expect(JSON.stringify(denied)).toContain("rejected by user");
++			// The gate fired exactly once and the denial never reached the body.
++			expect(permissionRequests).toEqual(["bash"]);
++			expect(body).not.toHaveBeenCalled();
++			verdict = "allow";
++			const allowed = await ctx.executeTool("bash", { command: "echo GATED" });
++			expect(allowed.isError).not.toBe(true);
++			expect(allowed).toEqual({ result: { content: [{ type: "text", text: "ran" }] } });
++			// No grant caching across calls: the gate re-runs per nested call.
++			expect(permissionRequests).toEqual(["bash", "bash"]);
++			expect(body).toHaveBeenCalledTimes(1);
++		});
++
++		it("fails closed to unknown-tool when the gated lookup is unavailable", async () => {
++			const runner = await makeRunner();
++			runner.setSessionToolResolver(() => undefined);
++			const ctx = runner.createContext(undefined, delegated(["read"]));
++			const outcome = await ctx.executeTool("read", { path: "x.txt" });
++			expect(outcome.isError).toBe(true);
++			expect(JSON.stringify(outcome)).toContain("Unknown tool: read");
++		});
++	});
+ });

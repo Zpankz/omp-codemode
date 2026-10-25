@@ -7,34 +7,56 @@ journal for kill-and-resume script runs. Built on `@earendil-works/pi-codemode`
 
 ## STATUS — read before installing
 
-**Parked on the omp 18.12.6 platform wall.** An extension-registered tool cannot
-invoke host tools on omp 18.12.6: the extension `pi` surface exposes `exec` and
-tool enumeration only, so `codemode` scripts bind **zero tools** regardless of
-bridge code (diagnosis and binary evidence in
-`docs/integration-result.md` §8). Until a future omp restores a
-nested-invoke API (`ctx.executeTool` / `reachesTools`), this plugin is
-**parked**: it installs, registers, and executes scripts (verified — see
-Install), but scripts can't call host tools yet.
+**Codemode WORKS with the bundled patch applied to omp v18.12.6.**
+`patches/oh-my-pi-v18.12.6-ctx-tools.patch` exposes `ctx.tools` /
+`ctx.executeTool` on the extension `ctx`, resolved through the eval bridge's
+ACP permission proxy — nested calls hit the same approval gate as `eval`;
+an explicit deny blocks even under `--auto-approve`.
+Live-verified on the patched binary: `codemode` returned
+`{ theme: dark, marker: CODEMODE_LIVE }`, and `durable_run` /
+`durable_resume` proved exactly-once resume (single `STEP` line after resume).
+**UNPATCHED omp: zero tools bound (parked)** — diagnosis and binary evidence
+in `docs/integration-result.md` §8.
 
-Two consequences follow from that:
+Two notes follow from that:
 
+- **`omp update` overwrites the patched binary** — re-apply the patch and
+  rebuild after updating (see Install § patched-omp).
 - **Codemode core is covered natively today.** omp's built-in `eval` tool
   (approval-gated, ON by default) already runs one JS script that calls tools in
   parallel and filters large output — the vanilla Pi v1.4 codemode function.
   See `docs/eval-probe.md` for the gate check + live probe, and
-  `docs/final-parity.md` for the full vanilla→omp function table.
+  `docs/final-parity.md` for the full vanilla→omp function table. This is still
+  true with no binary patch needed.
 - **Durable is experimental and OFF by default.** `durable_run` /
   `durable_resume` / `durable_status` register only with `PI_V1_DURABLE=1`.
   The journal semantics (commit-before-show, seq+name+argsHash replay,
-  exactly-once resume) are proven by `test/smoke-durable.ts`; wiring them into a
-  live session waits on the same platform fix.
+  exactly-once resume) are proven by `test/smoke-durable.ts` and by the live
+  exactly-once probe in `docs/integration-result.md` §12.
 
 ## Install
 
-Tested end-to-end on omp 18.12.6 (2026-10-25): install registers the
-`codemode` tool, a fresh `omp -p` session executed `return 1 + 1;` → `2`
-through the sandbox, and uninstall restored `settings.json` byte-identical.
-Note the STATUS above: scripts currently bind zero host tools on 18.12.6.
+### Patched omp (required for host-tool calls)
+
+```sh
+git clone https://github.com/can1357/oh-my-pi
+cd oh-my-pi && git checkout v18.12.6
+git apply /path/to/omp-codemode/patches/oh-my-pi-v18.12.6-ctx-tools.patch
+bun install
+bun --cwd=packages/natives run build
+bun --cwd=packages/coding-agent run build
+cp ~/.local/bin/omp ~/.local/bin/omp.upstream-18.12.6  # backup existing binary
+cp packages/coding-agent/dist/omp ~/.local/bin/omp && chmod +x ~/.local/bin/omp
+omp --version  # → omp/18.12.6
+```
+
+### Plugin
+
+Tested end-to-end on patched omp 18.12.6 (2026-10-26): install registers the
+`codemode` tool, a fresh `omp -p` session executed a script reading
+settings.json plus `echo CODEMODE_LIVE` → `{ theme: dark,
+marker: CODEMODE_LIVE }` through the sandbox, and uninstall restored
+`settings.json` byte-identical.
 
 ```sh
 git clone https://github.com/Zpankz/omp-codemode
