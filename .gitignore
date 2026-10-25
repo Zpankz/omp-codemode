@@ -1,0 +1,8 @@
+node_modules/
+test/tmp-*/
+*.log
+dist/*.map
+.DS_Store
+.env*
+*.jsonl
+.scratch/
